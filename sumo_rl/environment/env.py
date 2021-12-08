@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Union, Tuple
+from typing import Optional, Union
 import sumo_rl
 if 'SUMO_HOME' in os.environ:
     tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
@@ -42,9 +42,8 @@ class SumoEnvironment(gym.Env):
 
     :param net_file: (str) SUMO .net.xml file
     :param route_file: (str) SUMO .rou.xml file
-    :param out_csv_name: (Optional[str]) name of the .csv output with simulation results. If None no output is generated
+    :param out_csv_name: (str) name of the .csv output with simulation results. If None no output is generated
     :param use_gui: (bool) Wheter to run SUMO simulation with GUI visualisation
-    :param virtual_display: (Optional[Tuple[int,int]]) Resolution of a virtual display for rendering
     :param begin_time: (int) The time step (in seconds) the simulation starts
     :param num_seconds: (int) Number of simulated seconds on SUMO. The time in seconds the simulation must end.
     :param max_depart_delay: (int) Vehicles are discarded if they could not be inserted after max_depart_delay seconds
@@ -64,20 +63,25 @@ class SumoEnvironment(gym.Env):
         route_file: str, 
         out_csv_name: Optional[str] = None, 
         use_gui: bool = False, 
-        virtual_display: Optional[Tuple[int,int]] = None,
         begin_time: int = 0, 
         num_seconds: int = 20000, 
         max_depart_delay: int = 100000,
         time_to_teleport: int = -1, 
         delta_time: int = 5, 
-        yellow_time: int = 2, 
-        min_green: int = 5, 
-        max_green: int = 50, 
+        yellow_time: int = 0, 
+        min_green: int = 10, 
+        max_green: int = 60, 
         single_agent: bool = False, 
         sumo_seed: Union[str,int] = 'random', 
         fixed_ts: bool = False,
         sumo_warnings: bool = True,
+        sumo_wait_time_memory: int = 10000,
+        sumo_reward: int = 0,
+        sumo_routing: int = 0,
+        sumo_results: str = None,
+        sumo_episode: int = 0,
     ):
+
         self._net = net_file
         self._route = route_file
         self.use_gui = use_gui
@@ -85,8 +89,6 @@ class SumoEnvironment(gym.Env):
             self._sumo_binary = sumolib.checkBinary('sumo-gui')
         else:
             self._sumo_binary = sumolib.checkBinary('sumo')
-
-        self.virtual_display = virtual_display
 
         assert delta_time > yellow_time, "Time between actions must be at least greater than yellow time."
 
@@ -132,14 +134,26 @@ class SumoEnvironment(gym.Env):
         self.out_csv_name = out_csv_name
         self.observations = {ts: None for ts in self.ts_ids}
         self.rewards = {ts: None for ts in self.ts_ids}
+        self.sumo_wait_time_memory = sumo_wait_time_memory 
+        self.sumo_reward = sumo_reward
+        self.sumo_routing = sumo_routing
+        self.sumo_results = sumo_results
+        self.sumo_episode = sumo_episode
+        if not(self.sumo_routing == 0):
+            self.sumo_route_probability = str(1.0)
+        else:
+            self.sumo_route_probability = str(0.0)
     
     def _start_simulation(self):
         sumo_cmd = [self._sumo_binary,
                      '-n', self._net,
                      '-r', self._route,
+                     '--tripinfo-output', self.sumo_results+'tripinfo_'+str(self.sumo_episode),
                      '--max-depart-delay', str(self.max_depart_delay), 
-                     '--waiting-time-memory', '10000',
-                     '--time-to-teleport', str(self.time_to_teleport)]
+                     '--waiting-time-memory', str(self.sumo_wait_time_memory),
+                     '--time-to-teleport', str(self.time_to_teleport),
+                     '--device.rerouting.probability', self.sumo_route_probability,
+                     '--device.rerouting.period',str(self.sumo_routing)]
         if self.begin_time > 0:
             sumo_cmd.append('-b {}'.format(self.begin_time))
         if self.sumo_seed == 'random':
@@ -150,23 +164,13 @@ class SumoEnvironment(gym.Env):
             sumo_cmd.append('--no-warnings')
         if self.use_gui:
             sumo_cmd.extend(['--start', '--quit-on-end'])
-            if self.virtual_display is not None:
-                sumo_cmd.extend(['--window-size', f'{self.virtual_display[0]},{self.virtual_display[1]}'])
-                from pyvirtualdisplay.smartdisplay import SmartDisplay
-                print("Creating a virtual display.")
-                self.disp = SmartDisplay(size=self.virtual_display)
-                self.disp.start()
-                print("Virtual display started.")
-
+        
         if LIBSUMO:
             traci.start(sumo_cmd)
             self.sumo = traci
         else:
             traci.start(sumo_cmd, label=self.label)
             self.sumo = traci.getConnection(self.label)
-        
-        if self.use_gui:
-            self.sumo.gui.setSchema(traci.gui.DEFAULT_VIEW, "real world")                
 
     def reset(self):
         if self.run != 0:
@@ -200,7 +204,14 @@ class SumoEnvironment(gym.Env):
         return self.sumo.simulation.getTime()
 
     def step(self, action):
+        
         # No action, follow fixed TL defined in self.phases
+        """
+        if not(self.sumo_routing == 0) and (self.sim_step()%self.sumo_routing == 0):
+            v_list=traci.vehicle.getIDList()
+            for veh_id in v_list:
+                 traci.vehicle.rerouteTraveltime(veh_id,True)
+        """         
         if action is None or action == {}:
             for _ in range(self.delta_time):
                 self._sumo_step()
@@ -209,7 +220,7 @@ class SumoEnvironment(gym.Env):
             self._run_steps()
 
         observations = self._compute_observations()
-        rewards = self._compute_rewards()
+        rewards = self._compute_rewards(self.sumo_reward)
         dones = self._compute_dones()
         self._compute_info()
 
@@ -254,17 +265,17 @@ class SumoEnvironment(gym.Env):
         self.observations.update({ts: self.traffic_signals[ts].compute_observation() for ts in self.ts_ids if self.traffic_signals[ts].time_to_act})
         return {ts: self.observations[ts].copy() for ts in self.observations.keys() if self.traffic_signals[ts].time_to_act}
 
-    def _compute_rewards(self):
-        self.rewards.update({ts: self.traffic_signals[ts].compute_reward() for ts in self.ts_ids if self.traffic_signals[ts].time_to_act})
+    def _compute_rewards(self, option):
+        self.rewards.update({ts: self.traffic_signals[ts].compute_reward(option) for ts in self.ts_ids if self.traffic_signals[ts].time_to_act})
         return {ts: self.rewards[ts] for ts in self.rewards.keys() if self.traffic_signals[ts].time_to_act}
 
     @property
     def observation_space(self):
-        return self.traffic_signals[self.ts_ids[0]].observation_space
+        return {ts: self.traffic_signals[ts].observation_space for ts in self.ts_ids}
     
     @property
     def action_space(self):
-        return self.traffic_signals[self.ts_ids[0]].action_space
+        return {ts: self.traffic_signals[ts].action_space for ts in self.ts_ids}
     
     def observation_spaces(self, ts_id):
         return self.traffic_signals[ts_id].observation_space
@@ -276,12 +287,14 @@ class SumoEnvironment(gym.Env):
         self.sumo.simulationStep()
 
     def _compute_step_info(self):
-        return {
+        rew_dict = {'reward_'+str(ts): self.traffic_signals[ts].last_reward for ts in self.ts_ids}
+        met_dict = {
             'step_time': self.sim_step,
-            'reward': self.traffic_signals[self.ts_ids[0]].last_reward,
             'total_stopped': sum(self.traffic_signals[ts].get_total_queued() for ts in self.ts_ids),
             'total_wait_time': sum(sum(self.traffic_signals[ts].get_waiting_time_per_lane()) for ts in self.ts_ids)
         }
+        met_dict.update(rew_dict)
+        return met_dict
 
     def close(self):
         if self.sumo is None:
@@ -294,22 +307,14 @@ class SumoEnvironment(gym.Env):
     def __del__(self):
         self.close()
     
-    def render(self, mode='human'):
-        if self.virtual_display:
-            #img = self.sumo.gui.screenshot(traci.gui.DEFAULT_VIEW,
-            #                          f"temp/img{self.sim_step}.jpg", 
-            #                          width=self.virtual_display[0],
-            #                          height=self.virtual_display[1])
-            img = self.disp.grab()
-            if mode == 'rgb_array':
-                return np.array(img)
-            return img         
+    def render(self, mode=None):
+        pass
     
     def save_csv(self, out_csv_name, run):
         if out_csv_name is not None:
             df = pd.DataFrame(self.metrics)
             Path(Path(out_csv_name).parent).mkdir(parents=True, exist_ok=True)
-            df.to_csv(out_csv_name + '_conn{}_run{}'.format(self.label, run) + '.csv', index=False)
+            df.to_csv(out_csv_name + '_'+str(run) + '.csv', index=False)
 
     # Below functions are for discrete state space
 
@@ -325,7 +330,7 @@ class SumoEnvironment(gym.Env):
 
 
 class SumoEnvironmentPZ(AECEnv, EzPickle):
-    metadata = {'render.modes': ['human', 'rgb_array'], 'name': "sumo_rl_v0"}
+    metadata = {'render.modes': [], 'name': "sumo_rl_v0"}
 
     def __init__(self, **kwargs):
         EzPickle.__init__(self, **kwargs)

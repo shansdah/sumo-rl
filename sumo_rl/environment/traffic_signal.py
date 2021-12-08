@@ -124,11 +124,17 @@ class TrafficSignal:
         min_green = [0 if self.time_since_last_phase_change < self.min_green + self.yellow_time else 1]
         density = self.get_lanes_density()
         queue = self.get_lanes_queue()
-        observation = np.array(phase_id + min_green + density + queue, dtype=np.float32)
+        velocity = self.get_velocity_per_lane()
+        observation = np.array(phase_id + min_green + velocity + queue, dtype=np.float32)
         return observation
             
-    def compute_reward(self):
-        self.last_reward = self._waiting_time_reward()
+    def compute_reward(self, option):
+        if option == 0:
+            self.last_reward = self._queue_reward()
+        if option == 1:
+            self.last_reward = self._waiting_time_reward3()
+        if option == 2:
+            self.last_reward = self._pressure_reward()
         return self.last_reward
     
     def _pressure_reward(self):
@@ -141,7 +147,8 @@ class TrafficSignal:
         return reward
 
     def _queue_reward(self):
-        return - (sum(self.get_stopped_vehicles_num()))**2
+        #return - (sum(self.get_stopped_vehicles_num()))**2
+        return - ((self.get_total_queued())/100.0)
 
     def _waiting_time_reward(self):
         ts_wait = sum(self.get_waiting_time_per_lane()) / 100.0
@@ -159,7 +166,7 @@ class TrafficSignal:
         return reward
 
     def _waiting_time_reward3(self):
-        ts_wait = sum(self.get_waiting_time())
+        ts_wait = sum(self.get_waiting_time_per_lane()) / 1000.0
         reward = -ts_wait
         self.last_measure = ts_wait
         return reward
@@ -180,6 +187,16 @@ class TrafficSignal:
             wait_time_per_lane.append(wait_time)
         return wait_time_per_lane
 
+    def get_velocity_per_lane(self):
+        velocity_per_lane = []
+        for lane in self.lanes:
+            veh_list = self.sumo.lane.getLastStepVehicleIDs(lane)
+            velocity = 0.0
+            for veh in veh_list:
+                velocity += self.sumo.vehicle.getSpeed(veh)
+            velocity_per_lane.append(velocity/(float(len(veh_list))*100.0))
+            return velocity_per_lane      
+        
     def get_pressure(self):
         return abs(sum(self.sumo.lane.getLastStepVehicleNumber(lane) for lane in self.lanes) - sum(self.sumo.lane.getLastStepVehicleNumber(lane) for lane in self.out_lanes))
 
